@@ -66,7 +66,6 @@ const char *parity_str[] = {
     [P_ODD] = "odd",
     [P_MARK] = "mark",
     [P_SPACE] = "space",
-    [P_ERROR] = "invalid parity mode",
 };
 
 /* flow control modes names */
@@ -75,7 +74,6 @@ const char *flow_str[] = {
     [FC_RTSCTS] = "RTS/CTS",
     [FC_XONXOFF] = "xon/xoff",
     [FC_OTHER] = "other",
-    [FC_ERROR] = "invalid flow control mode",
 };
 
 /**********************************************************************/
@@ -127,12 +125,12 @@ const char *flow_str[] = {
 
 /* default character mappings */
 #define M_I_DFL 0
-#define M_O_DFL 0
+#define M_O_DFL (M_CRCRLF)
 #define M_E_DFL (M_DELBS | M_CRCRLF)
 
 /* character mapping names */
 struct map_names_s {
-    const char *name;
+    char *name;
     int flag;
 } map_names[] = {
     { "crlf", M_CRLF },
@@ -156,8 +154,7 @@ struct map_names_s {
 int
 parse_map (char *s)
 {
-    const char *m;
-    char *t;
+    char *m, *t;
     int f, flags, i;
 
     flags = 0;
@@ -210,6 +207,7 @@ struct {
     int imap;
     int omap;
     int emap;
+    char *send_file;
     char *log_filename;
     char *initstring;
     int exit_after;
@@ -220,13 +218,13 @@ struct {
     int raise_dtr;
     int quiet;
 } opts = {
-    .port = NULL,
-    .baud = 9600,
+    .port = NULL, //"/dev/ttyS0",
+    .baud = 115200,
     .flow = FC_NONE,
     .parity = P_NONE,
     .databits = 8,
     .stopbits = 1,
-    .lecho = 0,
+    .lecho = 1,
     .noinit = 0,
     .noreset = 0,
     .hangup = 0,
@@ -235,7 +233,8 @@ struct {
 #endif
     .escape = CKEY('a'),
     .noescape = 0,
-    .send_cmd = "sz -vv",
+    .send_file = NULL,
+    .send_cmd = "sb --ymodem -vv",
     .receive_cmd = "rz -vv -E",
     .imap = M_I_DFL,
     .omap = M_O_DFL,
@@ -852,8 +851,8 @@ baud_down (int baud)
     return nb;
 }
 
-enum flowcntrl_e
-flow_next (enum flowcntrl_e flow)
+int
+flow_next (int flow)
 {
     switch(flow) {
     case FC_NONE:
@@ -873,8 +872,8 @@ flow_next (enum flowcntrl_e flow)
     return flow;
 }
 
-enum parity_e
-parity_next (enum parity_e parity)
+int
+parity_next (int parity)
 {
     switch(parity) {
     case P_NONE:
@@ -1214,9 +1213,7 @@ int tty_q_push(const char *s, int len) {
 int
 do_command (unsigned char c)
 {
-    int newbaud, newbits, newstopbits;
-    enum flowcntrl_e newflow;
-    enum parity_e newparity;
+    int newbaud, newflow, newparity, newbits, newstopbits;
     const char *xfr_cmd;
     char *fname;
     unsigned char hexbuf[HEXBUF_SZ];
@@ -1562,8 +1559,6 @@ loop(void)
 void
 deadly_handler(int signum)
 {
-    (void)signum; /* silence unused warning */
-
     if ( ! sig_exit ) {
         sig_exit = 1;
         kill(0, SIGTERM);
@@ -1626,8 +1621,6 @@ show_usage(char *name)
 #endif
 #ifdef USE_CUSTOM_BAUD
     printf("  USE_CUSTOM_BAUD is enabled\n");
-    if ( ! use_custom_baud() )
-        printf("  NO_CUSTOM_BAUD is set\n");
 #endif
 
     printf("\nUsage is: %s [options] <tty port device>\n", s);
@@ -1646,6 +1639,7 @@ show_usage(char *name)
     printf("  --no<l>ock\n");
     printf("  --<s>end-cmd <command>\n");
     printf("  --recei<v>e-cmd <command>\n");
+    printf("  --send-file <z> <filename>\n");
     printf("  --imap <map> (input mappings)\n");
     printf("  --omap <map> (output mappings)\n");
     printf("  --emap <map> (local-echo mappings)\n");
@@ -1691,6 +1685,7 @@ parse_args(int argc, char *argv[])
 
     static struct option longOptions[] =
     {
+        {"send-file", required_argument, 0, 'z'},
         {"receive-cmd", required_argument, 0, 'v'},
         {"send-cmd", required_argument, 0, 's'},
         {"imap", required_argument, 0, 'I' },
@@ -1731,13 +1726,16 @@ parse_args(int argc, char *argv[])
         /* no default error messages printed. */
         opterr = 0;
 
-        c = getopt_long(argc, argv, "hirulcqXnv:s:r:e:f:b:y:d:p:g:t:x:",
+        c = getopt_long(argc, argv, "hirulcqXnv:s:r:e:f:b:y:d:p:g:t:x:z:",
                         longOptions, &optionIndex);
 
         if (c < 0)
             break;
 
         switch (c) {
+        case 'z':
+            opts.send_file = strdup(optarg);
+            break;
         case 's':
             strncpy(opts.send_cmd, optarg, sizeof(opts.send_cmd));
             opts.send_cmd[sizeof(opts.send_cmd) - 1] = '\0';
@@ -1876,11 +1874,9 @@ parse_args(int argc, char *argv[])
             }
             break;
         case 'g':
-            if ( opts.log_filename ) free(opts.log_filename);
             opts.log_filename = strdup(optarg);
             break;
         case 't':
-            if ( opts.initstring ) free(opts.initstring);
             opts.initstring = strdup(optarg);
             break;
         case 1:
@@ -1941,9 +1937,17 @@ parse_args(int argc, char *argv[])
         fprintf(stderr, "Run with '--help'.\n");
         exit(EXIT_FAILURE);
     }
-    opts.port = strdup(argv[argc-1]);
+    opts.port = strdup(argv[optind++]);
     if ( ! opts.port ) {
         fprintf(stderr, "Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if ( argc != optind ) {
+        fprintf(stderr, "Unexpected non-option arguments: ");
+        while (argc != optind)
+            fprintf(stderr, "%s ", argv[optind++]);
+        fprintf(stderr, "\n");
         exit(EXIT_FAILURE);
     }
 
@@ -1973,6 +1977,7 @@ parse_args(int argc, char *argv[])
 #endif
     printf("send_cmd is    : %s\n",
            (opts.send_cmd[0] == '\0') ? "disabled" : opts.send_cmd);
+    printf("send_file is   : %s\n", opts.send_file ? opts.send_file : "none");
     printf("receive_cmd is : %s\n",
            (opts.receive_cmd[0] == '\0') ? "disabled" : opts.receive_cmd);
     printf("imap is        : "); print_map(opts.imap);
@@ -2163,6 +2168,14 @@ main (int argc, char *argv[])
     if ( opts.initstring ) {
         free(opts.initstring);
         opts.initstring = NULL;
+    }
+    
+    // Send File from command line
+    if (opts.send_file)
+    {
+     run_cmd(tty_fd, opts.send_cmd, opts.send_file);
+     free(opts.send_file);
+     opts.send_file = NULL;   
     }
 
 #ifndef NO_HELP
